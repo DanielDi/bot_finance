@@ -1,4 +1,4 @@
-import os, json, re, datetime as dt
+import os, json, re, tempfile, datetime as dt
 import pytz
 from dotenv import load_dotenv
 
@@ -16,6 +16,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_NAME = os.getenv("GSPREAD_SHEET_NAME", "gastos_diarios")
 SA_JSON_PATH = os.getenv("GSPREAD_SA_JSON", "./service_account.json")
 TZ = pytz.timezone(os.getenv("TZ", "America/Bogota"))
+
+# === Config de transcripción de audio ===
+# Engine por defecto: OpenAI (recomendado para Railway). Alternativa: faster-whisper
+TRANSCRIBE_ENGINE = (os.getenv("TRANSCRIBE_ENGINE", "openai") or "openai").lower()
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+# Opcionales para faster-whisper
+FAST_WHISPER_MODEL = os.getenv("FAST_WHISPER_MODEL", "small")
+FAST_WHISPER_DEVICE = os.getenv("FAST_WHISPER_DEVICE", "cpu")
+FAST_WHISPER_COMPUTE = os.getenv("FAST_WHISPER_COMPUTE", "int8")
 
 # === Inicializar clientes ===
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -191,6 +200,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 'Comida 40.000 El Corral 20:30'\n"
         "Guardaré todo en tu Google Sheets 'gastos_diarios'."
     )
+    await update.message.reply_text("Tambien recibo audio (es/en) y lo transcribo.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -225,10 +235,129 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+# === Descarga y transcripción de audio ===
+async def _download_telegram_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Descarga voice/audio a un archivo temporal y devuelve su ruta."""
+    message = update.message
+    if not message:
+        raise RuntimeError("No message found")
+
+    file_id = None
+    suffix = ".ogg"
+    if message.voice:
+        file_id = message.voice.file_id
+        suffix = ".ogg"
+    elif message.audio:
+        file_id = message.audio.file_id
+        if message.audio.file_name and "." in message.audio.file_name:
+            suffix = os.path.splitext(message.audio.file_name)[1] or ".mp3"
+        else:
+            suffix = ".mp3"
+    else:
+        raise RuntimeError("Tipo de mensaje no soportado para audio")
+
+    tg_file = await context.bot.get_file(file_id)
+    fd, tmp_path = tempfile.mkstemp(prefix="tg_audio_", suffix=suffix)
+    os.close(fd)
+    await tg_file.download_to_drive(tmp_path)
+    return tmp_path
+
+def _transcribe_with_openai(path: str) -> str:
+    model = (OPENAI_TRANSCRIBE_MODEL or "gpt-4o-mini-transcribe").strip()
+    try:
+        with open(path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model=model,
+                file=f,
+                temperature=0,
+            )
+        text = getattr(resp, "text", None)
+        if not text:
+            text = str(resp)
+        return (text or "").strip()
+    except Exception as e:
+        if model != "whisper-1":
+            with open(path, "rb") as f:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    temperature=0,
+                )
+            text = getattr(resp, "text", None) or str(resp)
+            return (text or "").strip()
+        raise e
+
+def _transcribe_with_faster_whisper(path: str) -> str:
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        raise RuntimeError("Para usar faster-whisper instala 'faster-whisper' y asegúrate de tener ffmpeg en el sistema.") from e
+
+    model = WhisperModel(FAST_WHISPER_MODEL, device=FAST_WHISPER_DEVICE, compute_type=FAST_WHISPER_COMPUTE)
+    segments, info = model.transcribe(
+        path,
+        vad_filter=True,
+        without_timestamps=True,
+        beam_size=5,
+    )
+    text_parts = [seg.text for seg in segments]
+    return (" ".join(text_parts)).strip()
+
+def transcribe_audio_file(path: str) -> str:
+    engine = TRANSCRIBE_ENGINE
+    if engine == "openai":
+        return _transcribe_with_openai(path)
+    elif engine in ("faster-whisper", "faster_whisper", "fwhisper"):
+        return _transcribe_with_faster_whisper(path)
+    else:
+        return _transcribe_with_openai(path)
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tmp_path = await _download_telegram_media(update, context)
+        try:
+            transcript = transcribe_audio_file(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        if not transcript:
+            await update.message.reply_text("No pude transcribir el audio ??. ¿Podés intentar de nuevo o mandar texto?")
+            return
+
+        rec = call_gpt_extract(transcript)
+        if not rec:
+            await update.message.reply_text("?? No entendí el gasto del audio. Decime el monto y una descripción corta (ej: 'comida almuerzo 28000').")
+            return
+
+        rec = normalize_record(rec)
+
+        if not rec["valor"]:
+            await update.message.reply_text("?? Me falta el valor del gasto. Enviame el monto (ej: 25000 o 28.500).\nTranscripción: " + transcript[:500])
+            return
+        if not has_required_description(rec):
+            await update.message.reply_text("?? Necesito una descripción/categoría. Decime algo como: 'comida/almuerzo', 'transporte/taxi' o un detalle corto.\nTranscripción: " + transcript[:500])
+            return
+
+        rec = enforce_business_rules(rec)
+        persist_to_gsheets(rec)
+
+        await update.message.reply_text(
+            f"? Guardado (audio): {rec['categoria']} / {rec['subcategoria']} | ${rec['valor']} | {rec['fecha']} {rec['hora']}"
+            + (f" | {rec['plataforma']}" if rec.get('plataforma') else "")
+            + (f" | {rec['tienda']}" if rec.get('tienda') else "")
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error transcribiendo audio: {e}")
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Soporte de mensajes de audio y voice
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_audio))
     app.run_polling()
 
 if __name__ == "__main__":

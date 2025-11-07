@@ -84,11 +84,28 @@ def is_valid_time(s: str) -> bool:
 
 # === Parseo de JSON estricto desde la respuesta de GPT ===
 def parse_json_strict(text):
+    if not text:
+        return None
+    # Intento directo
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Buscar un objeto {...}
     try:
         start = text.find("{")
         end = text.rfind("}")
-        if start != -1 and end != -1:
+        if start != -1 and end != -1 and end > start:
             return json.loads(text[start:end+1])
+    except Exception:
+        pass
+    # Buscar una lista [...]
+    try:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            arr = json.loads(text[start:end+1])
+            return {"gastos": arr}
     except Exception:
         pass
     return None
@@ -121,6 +138,51 @@ def call_gpt_extract(msg_text):
     )
     txt = resp.choices[0].message.content.strip()
     return parse_json_strict(txt)
+
+# === Extracción multi-gasto ===
+def call_gpt_extract_many(msg_text):
+    system_prompt = (
+        "Eres un extractor estricto de gastos personales en Colombia. "
+        "Devuelves SOLO JSON válido, sin texto adicional, con la forma: "
+        "{\"gastos\": [ {\"fecha\":\"\",\"hora\":\"\",\"valor\":0,\"plataforma\":\"\",\"tienda\":\"\",\"categoria\":\"\",\"subcategoria\":\"\",\"detalle\":\"\"}, ... ]}. "
+        "Reglas: "
+        "- Identifica TODOS los gastos presentes en el texto (pueden venir separados por comas, 'y', punto y aparte, saltos de línea, etc.). "
+        "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente para un gasto, deja \"fecha\" y/o \"hora\" como string vacío. "
+        "- Moneda por defecto COP; normaliza '28.500' a 28500 (entero). "
+        "- 'plataforma' es app (Uber, DiDi, Rappi, iFood, etc.) o vacío. "
+        "- 'tienda' es comercio/lugar si se menciona. "
+        "- 'categoria/subcategoria' concisas ('comida/almuerzo', 'transporte/taxi', etc.). "
+        "- 'detalle' es descripción breve. "
+        "- Nunca combines gastos distintos en uno solo; crea un objeto por cada gasto."
+    )
+    user_prompt = f'Texto: "{msg_text}"'
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        temperature=0.1,
+        messages=[
+            {"role":"system","content":system_prompt},
+            {"role":"user","content":user_prompt}
+        ]
+    )
+    txt = (resp.choices[0].message.content or "").strip()
+    parsed = parse_json_strict(txt)
+    return parsed
+
+def _coerce_to_records(parsed):
+    """Normaliza la salida parseada a una lista de registros dict."""
+    if not parsed:
+        return []
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("gastos"), list):
+            return [x for x in parsed["gastos"] if isinstance(x, dict)]
+        # ¿vino un solo registro plano?
+        if any(k in parsed for k in HEADERS):
+            return [parsed]
+        return []
+    if isinstance(parsed, list):
+        return [x for x in parsed if isinstance(x, dict)]
+    return []
 
 # === Normalización: fecha/hora vacías o inválidas -> ahora; valor -> entero COP ===
 def normalize_record(rec):
@@ -201,6 +263,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Guardaré todo en tu Google Sheets 'gastos_diarios'."
     )
     await update.message.reply_text("Tambien recibo audio (es/en) y lo transcribo.")
+    await update.message.reply_text("También podés enviar varios gastos en un solo mensaje o audio y los separo automáticamente.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -232,6 +295,55 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f" | {rec['tienda']}" if rec.get('tienda') else "")
         )
 
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        parsed = call_gpt_extract_many(text)
+        records = _coerce_to_records(parsed)
+        if not records:
+            await update.message.reply_text("No pude entender el/los gasto(s). Decime el/los monto(s) y una descripción corta (ej: 'comida almuerzo 28000 y café 5000').")
+            return
+
+        saved, skipped = [], []
+        for rec in records:
+            rec = normalize_record(rec)
+            if not rec["valor"]:
+                skipped.append((rec, "Falta el valor"))
+                continue
+            if not has_required_description(rec):
+                skipped.append((rec, "Falta descripción/categoría"))
+                continue
+            rec = enforce_business_rules(rec)
+            try:
+                persist_to_gsheets(rec)
+                saved.append(rec)
+            except Exception as e:
+                skipped.append((rec, f"Error guardando: {e}"))
+
+        if not saved:
+            await update.message.reply_text("No se guardó ningún gasto. " + ("; ".join(reason for _, reason in skipped) if skipped else ""))
+            return
+
+        lines = [
+            f"Guardados: {len(saved)} gasto(s)" + (f" | Omitidos: {len(skipped)}" if skipped else "")
+        ]
+        for i, r in enumerate(saved, 1):
+            extra = []
+            if r.get('plataforma'):
+                extra.append(r['plataforma'])
+            if r.get('tienda'):
+                extra.append(r['tienda'])
+            extra_s = f" | {' / '.join(extra)}" if extra else ""
+            lines.append(f"{i}. {r['categoria']} / {r['subcategoria']} | ${r['valor']} | {r['fecha']} {r['hora']}{extra_s}")
+        if skipped:
+            lines.append("— Omitidos:")
+            for _, reason in skipped:
+                lines.append(f"• {reason}")
+
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -352,12 +464,73 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error transcribiendo audio: {e}")
 
+async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tmp_path = await _download_telegram_media(update, context)
+        try:
+            transcript = transcribe_audio_file(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        if not transcript:
+            await update.message.reply_text("No pude transcribir el audio. ¿Podés intentar de nuevo o mandar texto?")
+            return
+
+        parsed = call_gpt_extract_many(transcript)
+        records = _coerce_to_records(parsed)
+        if not records:
+            await update.message.reply_text("No entendí gastos en el audio. Decime el/los monto(s) y una descripción corta (ej: 'comida almuerzo 28000 y café 5000').\nTranscripción: " + transcript[:500])
+            return
+
+        saved, skipped = [], []
+        for rec in records:
+            rec = normalize_record(rec)
+            if not rec["valor"]:
+                skipped.append((rec, "Falta el valor"))
+                continue
+            if not has_required_description(rec):
+                skipped.append((rec, "Falta descripción/categoría"))
+                continue
+            rec = enforce_business_rules(rec)
+            try:
+                persist_to_gsheets(rec)
+                saved.append(rec)
+            except Exception as e:
+                skipped.append((rec, f"Error guardando: {e}"))
+
+        if not saved:
+            await update.message.reply_text("No se guardó ningún gasto del audio. " + ("; ".join(reason for _, reason in skipped) if skipped else "") + "\nTranscripción: " + transcript[:500])
+            return
+
+        lines = [
+            f"Guardados (audio): {len(saved)} gasto(s)" + (f" | Omitidos: {len(skipped)}" if skipped else "")
+        ]
+        for i, r in enumerate(saved, 1):
+            extra = []
+            if r.get('plataforma'):
+                extra.append(r['plataforma'])
+            if r.get('tienda'):
+                extra.append(r['tienda'])
+            extra_s = f" | {' / '.join(extra)}" if extra else ""
+            lines.append(f"{i}. {r['categoria']} / {r['subcategoria']} | ${r['valor']} | {r['fecha']} {r['hora']}{extra_s}")
+        if skipped:
+            lines.append("— Omitidos:")
+            for _, reason in skipped:
+                lines.append(f"• {reason}")
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error transcribiendo audio: {e}")
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_multi))
     # Soporte de mensajes de audio y voice
-    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_audio))
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_audio_multi))
     app.run_polling()
 
 if __name__ == "__main__":

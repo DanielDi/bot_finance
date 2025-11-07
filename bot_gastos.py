@@ -30,7 +30,10 @@ FAST_WHISPER_COMPUTE = os.getenv("FAST_WHISPER_COMPUTE", "int8")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # === Google Sheets helpers ===
-HEADERS = ["fecha","hora","valor","plataforma","tienda","categoria","subcategoria","detalle"]
+# Estructura esperada en la hoja 'gastos_diarios'
+GASTOS_HEADERS = [
+    "fecha","hora","valor","tienda","categoria_id","categoria","subcategoria","detalle"
+]
 
 # --- Soporte para credencial desde variable de entorno ---
 def ensure_sa_file():
@@ -50,15 +53,76 @@ def gspread_client():
     creds = Credentials.from_service_account_file(SA_JSON_PATH, scopes=scopes)
     return gspread.authorize(creds)
 
-def get_or_create_sheet():
+def get_gastos_ws():
     gc = gspread_client()
     sh = gc.open(SHEET_NAME)
-    ws = sh.sheet1
-    first_row = ws.row_values(1)
-    if [h.lower() for h in first_row] != HEADERS:
-        ws.clear()
-        ws.append_row(HEADERS)
-    return ws
+    # Intentar abrir la hoja por nombre explícito; si no existe, crearla
+    try:
+        return sh.worksheet("gastos_diarios")
+    except Exception:
+        try:
+            ws = sh.add_worksheet(title="gastos_diarios", rows=1000, cols=len(GASTOS_HEADERS))
+            ws.append_row(GASTOS_HEADERS)
+            return ws
+        except Exception:
+            # Último recurso: usar sheet1
+            return sh.sheet1
+
+def get_categorias_ws():
+    gc = gspread_client()
+    sh = gc.open(SHEET_NAME)
+    # Hoja "categorias" con columnas: Id, Categoria, Subcategoria, Descripción
+    try:
+        return sh.worksheet("categorias")
+    except Exception:
+        ws = sh.add_worksheet(title="categorias", rows=1000, cols=4)
+        ws.append_row(["Id","Categoria","Subcategoria","Descripción"])
+        return ws
+
+def load_categorias_map():
+    """Lee la hoja categorias y devuelve:
+    - mapa {(Categoria, Subcategoria): Id}
+    - max_id actual
+    Usar Title Case normalizado para claves del mapa.
+    """
+    ws = get_categorias_ws()
+    rows = ws.get_all_values()
+    if not rows:
+        return ws, {}, 0
+    header = [h.strip() for h in rows[0]]
+    idx_id = header.index("Id") if "Id" in header else 0
+    idx_cat = header.index("Categoria") if "Categoria" in header else 1
+    idx_sub = header.index("Subcategoria") if "Subcategoria" in header else 2
+    mapping = {}
+    max_id = 0
+    for r in rows[1:]:
+        if not any(r):
+            continue
+        try:
+            rid = int(str(r[idx_id]).strip()) if idx_id < len(r) and r[idx_id] != "" else None
+        except Exception:
+            rid = None
+        cat = (r[idx_cat] if idx_cat < len(r) else "").strip()
+        sub = (r[idx_sub] if idx_sub < len(r) else "").strip()
+        if rid is None:
+            continue
+        key = (to_title_case(cat), to_title_case(sub))
+        mapping[key] = rid
+        if rid > max_id:
+            max_id = rid
+    return ws, mapping, max_id
+
+def ensure_categoria_id(categoria: str, subcategoria: str) -> int:
+    """Devuelve el Id para (categoria, subcategoria). Si no existe en la hoja categorias, lo agrega."""
+    categoria_tc = to_title_case(categoria or "")
+    subcategoria_tc = to_title_case(subcategoria or "")
+    ws_cat, mapping, max_id = load_categorias_map()
+    key = (categoria_tc, subcategoria_tc)
+    if key in mapping:
+        return mapping[key]
+    new_id = max_id + 1 if max_id else 1
+    ws_cat.append_row([new_id, categoria_tc, subcategoria_tc, ""], value_input_option="USER_ENTERED")
+    return new_id
 
 # === Utilidades de validación de fecha/hora ===
 DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -81,6 +145,15 @@ def is_valid_time(s: str) -> bool:
         return 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
     except Exception:
         return False
+
+# === Helpers de texto ===
+def to_title_case(s: str) -> str:
+    if not s:
+        return ""
+    try:
+        return str(s).strip().title()
+    except Exception:
+        return str(s).strip()
 
 # === Parseo de JSON estricto desde la respuesta de GPT ===
 def parse_json_strict(text):
@@ -115,7 +188,7 @@ def call_gpt_extract(msg_text):
     system_prompt = (
         "Eres un extractor estricto de gastos personales en Colombia. "
         "Devuelves SOLO JSON con estas claves exactas: "
-        "{'fecha','hora','valor','plataforma','tienda','categoria','subcategoria','detalle'}. "
+        "{'fecha','hora','valor','tienda','categoria','subcategoria','detalle'}. "
         "Reglas: "
         "- JSON válido, sin texto adicional. "
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente, deja \"fecha\" y/o \"hora\" como string vacío. "
@@ -144,7 +217,7 @@ def call_gpt_extract_many(msg_text):
     system_prompt = (
         "Eres un extractor estricto de gastos personales en Colombia. "
         "Devuelves SOLO JSON válido, sin texto adicional, con la forma: "
-        "{\"gastos\": [ {\"fecha\":\"\",\"hora\":\"\",\"valor\":0,\"plataforma\":\"\",\"tienda\":\"\",\"categoria\":\"\",\"subcategoria\":\"\",\"detalle\":\"\"}, ... ]}. "
+        "{\"gastos\": [ {\"fecha\":\"\",\"hora\":\"\",\"valor\":0,\"tienda\":\"\",\"categoria\":\"\",\"subcategoria\":\"\",\"detalle\":\"\"}, ... ]}. "
         "Reglas: "
         "- Identifica TODOS los gastos presentes en el texto (pueden venir separados por comas, 'y', punto y aparte, saltos de línea, etc.). "
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente para un gasto, deja \"fecha\" y/o \"hora\" como string vacío. "
@@ -153,6 +226,7 @@ def call_gpt_extract_many(msg_text):
         "- 'tienda' es comercio/lugar si se menciona. "
         "- 'categoria/subcategoria' concisas ('comida/almuerzo', 'transporte/taxi', etc.). "
         "- 'detalle' es descripción breve. "
+        "- Regla personalizada: si el texto dice 'se lo di a negro', 'a negro', 'se lo di a dani' o 'a dani' (sin importar mayúsculas/minúsculas), entonces para esos gastos fija 'categoria' = 'Negro' y selecciona 'subcategoria' según el contexto: 'restaurante' (comida/restaurante/almuerzo/cena/desayuno), 'mercado' (super/mercado/víveres/compras de comida), 'transporte' (taxi/uber/bus/gasolina/peaje), o 'otros' si no encaja en los anteriores. "
         "- Nunca combines gastos distintos en uno solo; crea un objeto por cada gasto."
     )
     user_prompt = f'Texto: "{msg_text}"'
@@ -177,7 +251,7 @@ def _coerce_to_records(parsed):
         if isinstance(parsed.get("gastos"), list):
             return [x for x in parsed["gastos"] if isinstance(x, dict)]
         # ¿vino un solo registro plano?
-        if any(k in parsed for k in HEADERS):
+        if any(k in parsed for k in ("valor","tienda","categoria","subcategoria","detalle")):
             return [parsed]
         return []
     if isinstance(parsed, list):
@@ -209,12 +283,23 @@ def normalize_record(rec):
     rec["fecha"] = fecha
     rec["hora"]  = hora
 
-    # strings seguros
-    for k in ["plataforma","tienda","categoria","subcategoria","detalle"]:
-        rec[k] = (rec.get(k,"") or "").strip()
+    # strings seguros y normalización de tienda/categoría/subcategoría
+    plataforma = (rec.get("plataforma", "") or "").strip()
+    tienda = (rec.get("tienda", "") or "").strip()
+    if not tienda and plataforma:
+        tienda = plataforma
+    rec["tienda"] = to_title_case(tienda)
 
-    # asegurar todas las claves
-    for k in HEADERS:
+    rec["categoria"] = to_title_case((rec.get("categoria", "") or "").strip())
+    rec["subcategoria"] = to_title_case((rec.get("subcategoria", "") or "").strip())
+    rec["detalle"] = (rec.get("detalle", "") or "").strip()
+
+    # Normaliza categoría Negro
+    if (rec.get("categoria") or "").strip().lower() == "negro":
+        rec["categoria"] = "Negro"
+
+    # Asegurar claves esperadas
+    for k in ["fecha","hora","valor","tienda","categoria","subcategoria","detalle"]:
         rec.setdefault(k, "")
 
     return rec
@@ -237,13 +322,26 @@ def enforce_business_rules(rec):
     if cat in ("alimentación", "alimentacion", "comida"):
         # Ventana 18:00–23:59 o 00:00–01:59 (cruza medianoche)
         if (hh >= 18) or (0 <= hh < 2):
-            rec["subcategoria"] = "cena"
+            rec["subcategoria"] = "Cena"
 
     return rec
 
 def persist_to_gsheets(rec):
-    ws = get_or_create_sheet()
-    row = [rec.get(k,"") for k in HEADERS]
+    ws = get_gastos_ws()
+    # Obtener/crear ID de categoría
+    cat_id = ensure_categoria_id(rec.get("categoria", ""), rec.get("subcategoria", ""))
+
+    # Armar fila en el orden esperado por la hoja 'gastos_diarios'
+    row = [
+        rec.get("fecha", ""),
+        rec.get("hora", ""),
+        rec.get("valor", ""),
+        rec.get("tienda", ""),
+        cat_id,
+        rec.get("categoria", ""),
+        rec.get("subcategoria", ""),
+        rec.get("detalle", ""),
+    ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 # === Helpers de validación obligatoria ===
@@ -331,12 +429,7 @@ async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Guardados: {len(saved)} gasto(s)" + (f" | Omitidos: {len(skipped)}" if skipped else "")
         ]
         for i, r in enumerate(saved, 1):
-            extra = []
-            if r.get('plataforma'):
-                extra.append(r['plataforma'])
-            if r.get('tienda'):
-                extra.append(r['tienda'])
-            extra_s = f" | {' / '.join(extra)}" if extra else ""
+            extra_s = f" | {r['tienda']}" if r.get('tienda') else ""
             lines.append(f"{i}. {r['categoria']} / {r['subcategoria']} | ${r['valor']} | {r['fecha']} {r['hora']}{extra_s}")
         if skipped:
             lines.append("— Omitidos:")
@@ -346,6 +439,20 @@ async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
+
+async def start2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hola 👋 Soy tu bot de gastos.\n"
+        "- Obligatorio: monto y descripción (categoría/subcategoría/detalle).\n"
+        "- Soporto varios gastos en un solo mensaje o audio.\n"
+        "- Regla cena: si la categoría es 'alimentación/comida' y es entre 18:00 y 02:00, subcategoría = 'cena'.\n"
+        "- Regla Negro/Dani: si dices 'se lo di a negro' o 'a dani', la categoría = 'Negro' y la subcategoría según el caso: 'restaurante', 'mercado', 'transporte' u 'otros'.\n"
+        "Ejemplos:\n"
+        "• 'Almuerzo 28.500 en El Corral'\n"
+        "• 'Café 5.000 y taxi 12.000'\n"
+        "• 'Le di a negro 20.000 para taxi' (Negro / transporte)\n"
+        "Guardaré todo en tu Google Sheets 'gastos_diarios'."
+    )
 
 # === Descarga y transcripción de audio ===
 async def _download_telegram_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -509,12 +616,7 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Guardados (audio): {len(saved)} gasto(s)" + (f" | Omitidos: {len(skipped)}" if skipped else "")
         ]
         for i, r in enumerate(saved, 1):
-            extra = []
-            if r.get('plataforma'):
-                extra.append(r['plataforma'])
-            if r.get('tienda'):
-                extra.append(r['tienda'])
-            extra_s = f" | {' / '.join(extra)}" if extra else ""
+            extra_s = f" | {r['tienda']}" if r.get('tienda') else ""
             lines.append(f"{i}. {r['categoria']} / {r['subcategoria']} | ${r['valor']} | {r['fecha']} {r['hora']}{extra_s}")
         if skipped:
             lines.append("— Omitidos:")
@@ -527,7 +629,7 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start2))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_multi))
     # Soporte de mensajes de audio y voice
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_audio_multi))

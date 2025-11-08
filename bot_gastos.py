@@ -1,4 +1,5 @@
 import os, json, re, tempfile, datetime as dt, traceback
+from difflib import SequenceMatcher
 import pytz
 from dotenv import load_dotenv
 
@@ -33,6 +34,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Estructura esperada en la hoja 'gastos_diarios'
 GASTOS_HEADERS = [
     "fecha","hora","valor","tienda","categoria_id","categoria","subcategoria","detalle"
+]
+
+CATEGORIES_REFERENCE = [
+    "1: Comida / Antojo — Postres, comidas pequeñas",
+    "2: Comida / Restaurantes",
+    "3: Comida / Mercado",
+    "4: Compras / Ropa",
+    "5: Entretenimiento / Videojuegos",
+    "6: Negro / Antojo",
+    "7: Negro / Ropa",
+    "8: Negro / Transporte",
+    "9: Negro / Salud",
+    "10: Negro / Restaurantes",
+    "11: Negro / Mercado",
+    "12: Personal / Salud",
+    "13: Regalo / Familia",
+    "14: Regalo / Familia Negro",
+    "15: Regalo / Donaciones",
+    "16: Regalo / Amigos",
+    "17: Transporte / Propio — Vehículos propios",
+    "18: Transporte / Público — Metro, taxi, buses",
+    "19: Transporte / Plataformas — Uber, DiDi, inDrive",
+    "20: Regalo / Otros",
 ]
 
 # --- Soporte para credencial desde variable de entorno ---
@@ -121,6 +145,10 @@ def ensure_categoria_id(categoria: str, subcategoria: str) -> int:
     key = (categoria_tc, subcategoria_tc)
     if key in mapping:
         return mapping[key]
+    # Intentar encontrar la combinación más parecida ya existente
+    best_key = _best_matching_category(categoria_tc, subcategoria_tc, mapping)
+    if best_key in mapping:
+        return mapping[best_key]
     new_id = max_id + 1 if max_id else 1
     ws_cat.append_row([new_id, categoria_tc, subcategoria_tc, ""], value_input_option="USER_ENTERED")
     return new_id
@@ -271,6 +299,25 @@ def canonicalize_cat_sub(categoria: str, subcategoria: str) -> tuple:
 
     return cat, sub
 
+def _best_matching_category(cat: str, sub: str, mapping: dict) -> tuple:
+    """Busca la combinación existente más cercana usando similitud."""
+    target = f"{cat}|{sub}".lower()
+    best_key = None
+    best_score = 0.0
+    for key in mapping.keys():
+        cand = f"{key[0]}|{key[1]}".lower()
+        score = SequenceMatcher(None, target, cand).ratio()
+        if score > best_score:
+            best_score = score
+            best_key = key
+    if best_key and best_score >= 0.75:
+        return best_key
+    # Coincidencia exacta por categoría si sub no existe
+    for key in mapping.keys():
+        if key[0].lower() == cat.lower():
+            return key
+    return (cat, sub)
+
 def pad_time(h: str) -> str:
     """Asegura formato HH:MM:SS para mejorar parseo en Sheets locales ES."""
     try:
@@ -314,6 +361,7 @@ def parse_json_strict(text):
 
 # === Llamada a GPT: NO inferir fecha/hora; dejarlas vacías si no están en el texto ===
 def call_gpt_extract(msg_text):
+    categories_hint = "; ".join(CATEGORIES_REFERENCE)
     system_prompt = (
         "Eres un extractor estricto de gastos personales en Colombia. "
         "Devuelves SOLO JSON con estas claves exactas: "
@@ -322,8 +370,8 @@ def call_gpt_extract(msg_text):
         "- JSON válido, sin texto adicional. "
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente, deja \"fecha\" y/o \"hora\" como string vacío. "
         "- Moneda por defecto COP; normaliza '28.500' → 28500 (entero). "
-        "- \"tienda\" es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
-
+        "- 'tienda' es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
+        f"- Categorías disponibles: {categories_hint}. Usa una de esas combinaciones (p.ej. 'Comida/Restaurantes', 'Regalo/Familia Negro'). "
         "- 'categoria/subcategoria' concisas ('comida/almuerzo', 'transporte/taxi', etc.). "
         "- 'detalle' es descripción breve. "
         "- No incluyas explicaciones ni comentarios, solo el JSON."
@@ -343,6 +391,7 @@ def call_gpt_extract(msg_text):
 
 # === Extracción multi-gasto ===
 def call_gpt_extract_many(msg_text):
+    categories_hint = "; ".join(CATEGORIES_REFERENCE)
     system_prompt = (
         "Eres un extractor estricto de gastos personales en Colombia. "
         "Devuelves SOLO JSON válido, sin texto adicional, con la forma: "
@@ -368,6 +417,7 @@ def call_gpt_extract_many(msg_text):
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente para un gasto, deja \"fecha\" y/o \"hora\" como string vacío. "
         "- Moneda por defecto COP; normaliza '28.500' a 28500 (entero). "
         "- 'tienda' es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
+        f"- Categorías disponibles: {categories_hint}. Usa la que mejor encaje (ej: 'Comida/Restaurantes', 'Regalo/Familia Negro', 'Transporte/Plataformas'). "
         "- 'categoria/subcategoria' concisas ('Comida/Restaurantes', 'Comida/Mercado', 'Transporte/Plataformas', etc.). "
         "- 'detalle' es descripción breve. "
         "- Regla personalizada: si el texto dice 'se lo di a negro', 'a negro', 'se lo di a dani' o 'a dani' (sin importar mayúsculas/minúsculas), entonces para esos gastos fija 'categoria' = 'Negro' y selecciona 'subcategoria' según el contexto: 'Restaurantes', 'Mercado', 'Transporte' u 'Otros'. "

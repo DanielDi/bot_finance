@@ -113,9 +113,10 @@ def load_categorias_map():
     return ws, mapping, max_id
 
 def ensure_categoria_id(categoria: str, subcategoria: str) -> int:
-    """Devuelve el Id para (categoria, subcategoria). Si no existe en la hoja categorias, lo agrega."""
-    categoria_tc = to_title_case(categoria or "")
-    subcategoria_tc = to_title_case(subcategoria or "")
+    """Devuelve el Id para (categoria, subcategoria). Si no existe en la hoja categorias, lo agrega.
+    Aplica normalización y canónica para evitar duplicados por variantes.
+    """
+    categoria_tc, subcategoria_tc = canonicalize_cat_sub(categoria, subcategoria)
     ws_cat, mapping, max_id = load_categorias_map()
     key = (categoria_tc, subcategoria_tc)
     if key in mapping:
@@ -207,6 +208,68 @@ def to_title_case(s: str) -> str:
         return str(s).strip().title()
     except Exception:
         return str(s).strip()
+
+def canonicalize_cat_sub(categoria: str, subcategoria: str) -> tuple:
+    """Mapea variantes a las etiquetas canónicas existentes en la hoja 'categorias'.
+    Devuelve (Categoria, Subcategoria) normalizados en Title Case.
+    """
+    cat = to_title_case(categoria or "")
+    sub = to_title_case(subcategoria or "")
+
+    # Normaliza acentos y variantes simples
+    def n(s: str) -> str:
+        return (s or "").strip().lower().replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
+
+    cn = n(cat)
+    sn = n(sub)
+
+    # Categorías canónicas conocidas
+    if cn in ("comida", "alimentacion", "alimentacion"):  # robustez doble
+        cat = "Comida"
+    elif cn == "negro":
+        cat = "Negro"
+    elif cn == "compras":
+        cat = "Compras"
+    elif cn == "entretenimiento":
+        cat = "Entretenimiento"
+    elif cn == "personal":
+        cat = "Personal"
+    elif cn == "regalo":
+        cat = "Regalo"
+    elif cn == "transporte":
+        cat = "Transporte"
+
+    # Subcategorías canónicas por sinónimos frecuentes
+    if sn in ("restaurante", "restaurantes", "cena", "almuerzo", "desayuno"):
+        sub = "Restaurantes"
+    elif sn in ("mercado", "mercados", "super", "supermercado", "supermercados", "viveres", "viveres"):
+        sub = "Mercado"
+    elif sn in ("antojo", "antojitos", "postre", "postres", "helado", "snack", "dulces"):
+        sub = "Antojo"
+    elif sn in ("ropa", "vestimenta"):
+        sub = "Ropa"
+    elif sn in ("videojuego", "videojuegos", "gaming"):
+        sub = "Videojuegos"
+    elif sn in ("salud", "medicina", "medicamentos"):
+        sub = "Salud"
+    elif sn in ("familia negro", "familianegro"):
+        sub = "Familia Negro"
+    elif sn in ("donacion", "donaciones"):
+        sub = "Donaciones"
+    elif sn in ("familia",):
+        sub = "Familia"
+    elif sn in ("amigos", "amigo", "amiga"):
+        sub = "Amigos"
+    elif sn in ("plataforma", "plataformas", "uber", "didi", "indrive", "cabify"):
+        sub = "Plataformas"
+    elif sn in ("publico", "transporte publico", "taxi", "bus", "metro"):
+        sub = "Público"
+    elif sn in ("propio", "gasolina", "peaje", "parqueadero"):
+        sub = "Propio"
+    elif sn in ("otros", "otro"):
+        sub = "Otros"
+
+    return cat, sub
 
 def pad_time(h: str) -> str:
     """Asegura formato HH:MM:SS para mejorar parseo en Sheets locales ES."""
@@ -371,8 +434,9 @@ def normalize_record(rec):
         tienda = plataforma
     rec["tienda"] = to_title_case(tienda)
 
-    rec["categoria"] = to_title_case((rec.get("categoria", "") or "").strip())
-    rec["subcategoria"] = to_title_case((rec.get("subcategoria", "") or "").strip())
+    rec["categoria"], rec["subcategoria"] = canonicalize_cat_sub(
+        rec.get("categoria", ""), rec.get("subcategoria", "")
+    )
     rec["detalle"] = (rec.get("detalle", "") or "").strip()
 
     # Normaliza categoría Negro
@@ -381,6 +445,10 @@ def normalize_record(rec):
 
     # Sinónimos y estandarización de categorías/subcategorías
     rec = apply_synonym_normalization(rec)
+    # Reaplicar canónico tras posibles cambios
+    rec["categoria"], rec["subcategoria"] = canonicalize_cat_sub(
+        rec.get("categoria", ""), rec.get("subcategoria", "")
+    )
 
     # Asegurar claves esperadas
     for k in ["fecha","hora","valor","tienda","categoria","subcategoria","detalle"]:

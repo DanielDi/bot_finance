@@ -1,4 +1,4 @@
-import os, json, re, tempfile, datetime as dt
+import os, json, re, tempfile, datetime as dt, traceback
 import pytz
 from dotenv import load_dotenv
 
@@ -710,6 +710,10 @@ async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 persist_to_gsheets(rec)
                 saved.append(rec)
             except Exception as e:
+                try:
+                    print("Persist error:\n" + traceback.format_exc())
+                except Exception:
+                    pass
                 skipped.append((rec, f"Error guardando: {e}"))
 
         if not saved:
@@ -898,6 +902,10 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 persist_to_gsheets(rec)
                 saved.append(rec)
             except Exception as e:
+                try:
+                    print("Persist error (audio):\n" + traceback.format_exc())
+                except Exception:
+                    pass
                 skipped.append((rec, f"Error guardando: {e}"))
 
         if not saved:

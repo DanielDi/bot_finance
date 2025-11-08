@@ -229,6 +229,21 @@ def call_gpt_extract_many(msg_text):
         "- Regla personalizada: si el texto dice 'se lo di a negro', 'a negro', 'se lo di a dani' o 'a dani' (sin importar mayúsculas/minúsculas), entonces para esos gastos fija 'categoria' = 'Negro' y selecciona 'subcategoria' según el contexto: 'restaurante' (comida/restaurante/almuerzo/cena/desayuno), 'mercado' (super/mercado/víveres/compras de comida), 'transporte' (taxi/uber/bus/gasolina/peaje), o 'otros' si no encaja en los anteriores. "
         "- Nunca combines gastos distintos en uno solo; crea un objeto por cada gasto."
     )
+    # Override: versión sin 'plataforma' y usando 'tienda' también para apps/web
+    system_prompt = (
+        "Eres un extractor estricto de gastos personales en Colombia. "
+        "Devuelves SOLO JSON válido, sin texto adicional, con la forma: "
+        "{\"gastos\": [ {\"fecha\":\"\",\"hora\":\"\",\"valor\":0,\"tienda\":\"\",\"categoria\":\"\",\"subcategoria\":\"\",\"detalle\":\"\"}, ... ]}. "
+        "Reglas: "
+        "- Identifica TODOS los gastos presentes en el texto (separados por comas, 'y', punto y aparte, saltos de línea, etc.). "
+        "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente para un gasto, deja \"fecha\" y/o \"hora\" como string vacío. "
+        "- Moneda por defecto COP; normaliza '28.500' a 28500 (entero). "
+        "- 'tienda' es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
+        "- 'categoria/subcategoria' concisas ('Comida/Restaurantes', 'Comida/Mercado', 'Transporte/Plataformas', etc.). "
+        "- 'detalle' es descripción breve. "
+        "- Regla personalizada: si el texto dice 'se lo di a negro', 'a negro', 'se lo di a dani' o 'a dani' (sin importar mayúsculas/minúsculas), entonces para esos gastos fija 'categoria' = 'Negro' y selecciona 'subcategoria' según el contexto: 'Restaurantes', 'Mercado', 'Transporte' u 'Otros'. "
+        "- Nunca combines gastos distintos en uno solo; crea un objeto por cada gasto."
+    )
     user_prompt = f'Texto: "{msg_text}"'
 
     resp = client.chat.completions.create(
@@ -298,9 +313,104 @@ def normalize_record(rec):
     if (rec.get("categoria") or "").strip().lower() == "negro":
         rec["categoria"] = "Negro"
 
+    # Sinónimos y estandarización de categorías/subcategorías
+    rec = apply_synonym_normalization(rec)
+
     # Asegurar claves esperadas
     for k in ["fecha","hora","valor","tienda","categoria","subcategoria","detalle"]:
         rec.setdefault(k, "")
+
+    return rec
+
+def apply_synonym_normalization(rec):
+    """Mapea subcategorías y categorías a las existentes usando sinónimos.
+    No borra lo existente; solo ajusta a nombres canónicos cuando aplica.
+    """
+    cat = (rec.get("categoria") or "").strip()
+    sub = (rec.get("subcategoria") or "").strip()
+    tienda = (rec.get("tienda") or "").strip()
+    detalle = (rec.get("detalle") or "").strip()
+    text = f"{cat} {sub} {tienda} {detalle}".lower()
+
+    def has_any(words):
+        return any(w in text for w in words)
+
+    # Negro → subcategorías: Restaurantes, Mercado, Transporte, Otros
+    if cat.lower() == "negro":
+        if has_any(["super", "súper", "supermerc", "mercado", "víveres", "viveres", "despensa"]):
+            sub = "Mercado"
+        elif has_any(["uber", "didi", "indrive", "in drive", "cabify", "taxi", "bus", "buses", "metro", "gasolina", "peaje", "parqueadero"]):
+            sub = "Transporte"
+        elif has_any(["restaur", "comida", "almuerzo", "cena", "desayuno", "hamburg", "pizza", "pollo", "wok", "mcdonalds", "mc donalds", "kfc", "corral", "domino"]):
+            sub = "Restaurantes"
+        else:
+            sub = "Otros"
+        rec["subcategoria"] = sub
+        rec["categoria"] = "Negro"
+        return rec
+
+    # Comida
+    if cat.lower() in ("comida", "alimentacion", "alimentación") or has_any(["almuerzo", "cena", "desayuno", "restaur", "helado", "postre", "antojo", "mercado", "super", "supermerc"]):
+        cat = "Comida"
+        if sub.lower() == "cena":
+            sub = "Restaurantes"
+        elif has_any(["helado", "postre", "antojo", "snack", "dulce", "dulces", "percimon", "mimos"]):
+            sub = "Antojo"
+        elif has_any(["super", "súper", "supermerc", "mercado", "víveres", "viveres", "despensa"]):
+            sub = "Mercado"
+        else:
+            sub = "Restaurantes"
+        rec["categoria"], rec["subcategoria"] = cat, sub
+        return rec
+
+    # Transporte
+    if cat.lower() == "transporte" or has_any(["uber", "didi", "indrive", "in drive", "cabify", "taxi", "bus", "buses", "metro", "gasolina", "peaje", "parqueadero"]):
+        cat = "Transporte"
+        if has_any(["uber", "didi", "indrive", "cabify"]):
+            sub = "Plataformas"
+        elif has_any(["taxi", "bus", "buses", "metro", "transmilenio"]):
+            sub = "Público"
+        elif has_any(["gasolina", "peaje", "parqueadero"]):
+            sub = "Propio"
+        rec["categoria"], rec["subcategoria"] = cat, sub or rec.get("subcategoria", "")
+        return rec
+
+    # Compras / Ropa
+    if cat.lower() in ("compras",) or has_any(["ropa", "camisa", "pantal", "jean", "chaqueta", "zapato", "chevignon", "americanino"]):
+        cat = "Compras"
+        sub = "Ropa"
+        rec["categoria"], rec["subcategoria"] = cat, sub
+        return rec
+
+    # Entretenimiento / Videojuegos
+    if cat.lower() in ("entretenimiento",) or has_any(["steam", "xbox", "playstation", "psn", "nintendo", "epic", "videojuego"]):
+        cat = "Entretenimiento"
+        sub = "Videojuegos"
+        rec["categoria"], rec["subcategoria"] = cat, sub
+        return rec
+
+    # Personal / Salud
+    if cat.lower() in ("personal",) or has_any(["salud", "medicina", "medicamento", "medicamentos", "farmacia", "eps", "médico", "medico", "consulta"]):
+        cat = "Personal"
+        sub = "Salud"
+        rec["categoria"], rec["subcategoria"] = cat, sub
+        return rec
+
+    # Regalo (si se detecta palabra regalo)
+    if cat.lower() in ("regalo",) or has_any(["regalo", "donaci", "amigo", "familia"]):
+        cat = "Regalo"
+        if has_any(["donaci"]):
+            sub = "Donaciones"
+        elif has_any(["familia negro"]):
+            sub = "Familia Negro"
+        elif has_any(["familia"]):
+            sub = "Familia"
+        elif has_any(["amigo"]):
+            sub = "Amigos"
+        else:
+            sub = "Otros"
+        rec["categoria"], rec["subcategoria"] = cat, sub
+        return rec
 
     return rec
 
@@ -338,8 +448,8 @@ def persist_to_gsheets(rec):
         rec.get("valor", ""),
         rec.get("tienda", ""),
         cat_id,
-        rec.get("categoria", ""),
-        rec.get("subcategoria", ""),
+        "",  # categoria (la calcula la hoja por fórmula)
+        "",  # subcategoria (la calcula la hoja por fórmula)
         rec.get("detalle", ""),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")

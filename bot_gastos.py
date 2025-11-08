@@ -124,6 +124,59 @@ def ensure_categoria_id(categoria: str, subcategoria: str) -> int:
     ws_cat.append_row([new_id, categoria_tc, subcategoria_tc, ""], value_input_option="USER_ENTERED")
     return new_id
 
+def ensure_named_range_gastos(ws):
+    """Asegura que el rango con nombre 'gastos' cubra muchas filas para que
+    los nuevos registros queden dentro de la tabla. Si no existe, lo crea.
+    """
+    try:
+        sh = ws.spreadsheet
+        meta = sh.fetch_sheet_metadata()
+        named = meta.get("namedRanges", []) or []
+        target = None
+        for nr in named:
+            if (nr.get("name") or "").strip().lower() == "gastos":
+                target = nr
+                break
+        end_rows = max(10000, ws.row_count)
+        rng = {
+            "sheetId": ws.id,
+            "startRowIndex": 0,
+            "startColumnIndex": 0,
+            "endRowIndex": end_rows,
+            "endColumnIndex": len(GASTOS_HEADERS),
+        }
+        if target and target.get("namedRangeId"):
+            sh.batch_update({
+                "requests": [
+                    {
+                        "updateNamedRange": {
+                            "namedRange": {
+                                "namedRangeId": target["namedRangeId"],
+                                "range": rng,
+                            },
+                            "fields": "range",
+                        }
+                    }
+                ]
+            })
+        else:
+            sh.batch_update({
+                "requests": [
+                    {
+                        "addNamedRange": {
+                            "namedRange": {
+                                "name": "gastos",
+                                "range": rng,
+                            }
+                        }
+                    }
+                ]
+            })
+    except Exception:
+        # Si no se puede, no bloquea la inserción
+        pass
+        pass
+
 # === Utilidades de validación de fecha/hora ===
 DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RX = re.compile(r"^[0-2]\d:[0-5]\d$")  # 00:00–29:59 (luego verificamos rango real)
@@ -154,6 +207,24 @@ def to_title_case(s: str) -> str:
         return str(s).strip().title()
     except Exception:
         return str(s).strip()
+
+def to_gs_date_formula(fecha_iso: str) -> str:
+    """Convierte 'YYYY-MM-DD' a '=DATE(YYYY,MM,DD)' para forzar tipo fecha."""
+    try:
+        y, m, d = fecha_iso.split("-")
+        y = int(y); m = int(m); d = int(d)
+        return f"=DATE({y},{m},{d})"
+    except Exception:
+        return fecha_iso
+
+def to_gs_time_formula(hhmm: str) -> str:
+    """Convierte 'HH:MM' a '=TIME(HH,MM,SS)' (SS=0) para forzar tipo hora."""
+    try:
+        hh, mm = hhmm.split(":")
+        hh = int(hh); mm = int(mm)
+        return f"=TIME({hh},{mm},0)"
+    except Exception:
+        return hhmm
 
 # === Parseo de JSON estricto desde la respuesta de GPT ===
 def parse_json_strict(text):
@@ -438,13 +509,14 @@ def enforce_business_rules(rec):
 
 def persist_to_gsheets(rec):
     ws = get_gastos_ws()
+    ensure_named_range_gastos(ws)
     # Obtener/crear ID de categoría
     cat_id = ensure_categoria_id(rec.get("categoria", ""), rec.get("subcategoria", ""))
 
     # Armar fila en el orden esperado por la hoja 'gastos_diarios'
     row = [
-        rec.get("fecha", ""),
-        rec.get("hora", ""),
+        to_gs_date_formula(rec.get("fecha", "")),
+        to_gs_time_formula(rec.get("hora", "")),
         rec.get("valor", ""),
         rec.get("tienda", ""),
         cat_id,
@@ -747,3 +819,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

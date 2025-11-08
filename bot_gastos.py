@@ -208,23 +208,18 @@ def to_title_case(s: str) -> str:
     except Exception:
         return str(s).strip()
 
-def to_gs_date_formula(fecha_iso: str) -> str:
-    """Convierte 'YYYY-MM-DD' a '=DATE(YYYY,MM,DD)' para forzar tipo fecha."""
+def pad_time(h: str) -> str:
+    """Asegura formato HH:MM:SS para mejorar parseo en Sheets locales ES."""
     try:
-        y, m, d = fecha_iso.split("-")
-        y = int(y); m = int(m); d = int(d)
-        return f"=DATE({y},{m},{d})"
+        parts = (h or "").split(":")
+        if len(parts) == 2:
+            return f"{int(parts[0]):02d}:{int(parts[1]):02d}:00"
+        elif len(parts) == 3:
+            return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
+        else:
+            return h
     except Exception:
-        return fecha_iso
-
-def to_gs_time_formula(hhmm: str) -> str:
-    """Convierte 'HH:MM' a '=TIME(HH,MM,SS)' (SS=0) para forzar tipo hora."""
-    try:
-        hh, mm = hhmm.split(":")
-        hh = int(hh); mm = int(mm)
-        return f"=TIME({hh},{mm},0)"
-    except Exception:
-        return hhmm
+        return h
 
 # === Parseo de JSON estricto desde la respuesta de GPT ===
 def parse_json_strict(text):
@@ -264,8 +259,8 @@ def call_gpt_extract(msg_text):
         "- JSON válido, sin texto adicional. "
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente, deja \"fecha\" y/o \"hora\" como string vacío. "
         "- Moneda por defecto COP; normaliza '28.500' → 28500 (entero). "
-        "- 'plataforma' es app (Uber, DiDi, Rappi, iFood, etc.) o vacío. "
-        "- 'tienda' es comercio/lugar si se menciona. "
+        "- \"tienda\" es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
+
         "- 'categoria/subcategoria' concisas ('comida/almuerzo', 'transporte/taxi', etc.). "
         "- 'detalle' es descripción breve. "
         "- No incluyas explicaciones ni comentarios, solo el JSON."
@@ -293,8 +288,8 @@ def call_gpt_extract_many(msg_text):
         "- Identifica TODOS los gastos presentes en el texto (pueden venir separados por comas, 'y', punto y aparte, saltos de línea, etc.). "
         "- NO infieras fecha ni hora: si el usuario no las menciona explícitamente para un gasto, deja \"fecha\" y/o \"hora\" como string vacío. "
         "- Moneda por defecto COP; normaliza '28.500' a 28500 (entero). "
-        "- 'plataforma' es app (Uber, DiDi, Rappi, iFood, etc.) o vacío. "
-        "- 'tienda' es comercio/lugar si se menciona. "
+        "- \"tienda\" es comercio/lugar o app/página web donde se hizo (Uber, DiDi, Rappi, iFood, Steam, etc.). "
+
         "- 'categoria/subcategoria' concisas ('comida/almuerzo', 'transporte/taxi', etc.). "
         "- 'detalle' es descripción breve. "
         "- Regla personalizada: si el texto dice 'se lo di a negro', 'a negro', 'se lo di a dani' o 'a dani' (sin importar mayúsculas/minúsculas), entonces para esos gastos fija 'categoria' = 'Negro' y selecciona 'subcategoria' según el contexto: 'restaurante' (comida/restaurante/almuerzo/cena/desayuno), 'mercado' (super/mercado/víveres/compras de comida), 'transporte' (taxi/uber/bus/gasolina/peaje), o 'otros' si no encaja en los anteriores. "
@@ -367,7 +362,7 @@ def normalize_record(rec):
     if not is_valid_time(hora):
         hora = now.strftime("%H:%M")
     rec["fecha"] = fecha
-    rec["hora"]  = hora
+    rec["hora"]  = pad_time(hora)
 
     # strings seguros y normalización de tienda/categoría/subcategoría
     plataforma = (rec.get("plataforma", "") or "").strip()
@@ -391,6 +386,50 @@ def normalize_record(rec):
     for k in ["fecha","hora","valor","tienda","categoria","subcategoria","detalle"]:
         rec.setdefault(k, "")
 
+    return rec
+
+def refine_classification(rec):
+    """Ajustes finales: prioriza 'Regalo' por palabras clave salvo trigger explícito
+    de 'a negro'/'a dani'. Evita crear subcategorías nuevas por variaciones.
+    """
+    try:
+        text = f"{rec.get('categoria','')} {rec.get('subcategoria','')} {rec.get('tienda','')} {rec.get('detalle','')}".lower()
+        negro_trigger = re.search(r"\b(se\s*lo\s*di\s*a\s*(negro|dani)|a\s*(negro|dani))\b", text)
+        if (not negro_trigger) and ("regalo" in text or "donaci" in text or "familia" in text or "amigo" in text):
+            rec["categoria"] = "Regalo"
+            if "donaci" in text:
+                rec["subcategoria"] = "Donaciones"
+            elif "familia negro" in text:
+                rec["subcategoria"] = "Familia Negro"
+            elif "familia" in text:
+                rec["subcategoria"] = "Familia"
+            elif "amig" in text:
+                rec["subcategoria"] = "Amigos"
+            else:
+                rec["subcategoria"] = "Otros"
+    except Exception:
+        pass
+
+def ensure_basic_filter_range(ws):
+    """Asegura que el filtro básico cubra A1:H10000 para que el estilo de tabla
+    incluya nuevas filas. No rompe si no existe o falla.
+    """
+    try:
+        sh = ws.spreadsheet
+        rng = {
+            "sheetId": ws.id,
+            "startRowIndex": 0,
+            "startColumnIndex": 0,
+            "endRowIndex": max(10000, ws.row_count),
+            "endColumnIndex": len(GASTOS_HEADERS),
+        }
+        sh.batch_update({
+            "requests": [
+                {"setBasicFilter": {"filter": {"range": rng}}}
+            ]
+        })
+    except Exception:
+        pass
     return rec
 
 def apply_synonym_normalization(rec):
@@ -503,20 +542,21 @@ def enforce_business_rules(rec):
     if cat in ("alimentación", "alimentacion", "comida"):
         # Ventana 18:00–23:59 o 00:00–01:59 (cruza medianoche)
         if (hh >= 18) or (0 <= hh < 2):
-            rec["subcategoria"] = "Cena"
+            rec["subcategoria"] = "Restaurantes"
 
     return rec
 
 def persist_to_gsheets(rec):
     ws = get_gastos_ws()
     ensure_named_range_gastos(ws)
+    ensure_basic_filter_range(ws)
     # Obtener/crear ID de categoría
     cat_id = ensure_categoria_id(rec.get("categoria", ""), rec.get("subcategoria", ""))
 
     # Armar fila en el orden esperado por la hoja 'gastos_diarios'
     row = [
-        to_gs_date_formula(rec.get("fecha", "")),
-        to_gs_time_formula(rec.get("hora", "")),
+        rec.get("fecha", ""),
+        pad_time(rec.get("hora", "")),
         rec.get("valor", ""),
         rec.get("tienda", ""),
         cat_id,
@@ -597,6 +637,7 @@ async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skipped.append((rec, "Falta descripción/categoría"))
                 continue
             rec = enforce_business_rules(rec)
+            rec = refine_classification(rec)
             try:
                 persist_to_gsheets(rec)
                 saved.append(rec)
@@ -784,6 +825,7 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 skipped.append((rec, "Falta descripción/categoría"))
                 continue
             rec = enforce_business_rules(rec)
+            rec = refine_classification(rec)
             try:
                 persist_to_gsheets(rec)
                 saved.append(rec)

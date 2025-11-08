@@ -477,7 +477,7 @@ def refine_classification(rec):
                 rec["subcategoria"] = "Otros"
     except Exception:
         pass
-
+    return rec
 def ensure_basic_filter_range(ws):
     """Asegura que el filtro básico cubra A1:H10000 para que el estilo de tabla
     incluya nuevas filas. No rompe si no existe o falla.
@@ -498,8 +498,7 @@ def ensure_basic_filter_range(ws):
         })
     except Exception:
         pass
-    return rec
-
+    return ws
 def apply_synonym_normalization(rec):
     """Mapea subcategorías y categorías a las existentes usando sinónimos.
     No borra lo existente; solo ajusta a nombres canónicos cuando aplica.

@@ -331,6 +331,30 @@ def pad_time(h: str) -> str:
     except Exception:
         return h
 
+
+def infer_common_context(text: str) -> dict:
+    """Extrae contexto general (detalle y tienda) de la frase completa."""
+    ctx = {"detalle": "", "tienda": ""}
+    if not text:
+        return ctx
+    raw = text.strip()
+    lower = raw.lower()
+    idx = lower.find("divid")
+    if idx != -1:
+        raw = raw[:idx]
+    raw = raw.strip(" ,:\n")
+    if not raw:
+        return ctx
+    detail = raw
+    tienda = ""
+    match = re.search(r"\ben\s+([^,:\n]+)", raw, flags=re.IGNORECASE)
+    if match:
+        tienda = match.group(1).strip(" .")
+        detail = raw[:match.start()].strip(" ,:")
+    ctx["detalle"] = detail
+    ctx["tienda"] = tienda
+    return ctx
+
 # === Parseo de JSON estricto desde la respuesta de GPT ===
 def parse_json_strict(text):
     if not text:
@@ -744,8 +768,13 @@ async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No pude entender el/los gasto(s). Decime el/los monto(s) y una descripción corta (ej: 'comida almuerzo 28000 y café 5000').")
             return
 
+        common_ctx = infer_common_context(text)
         saved, skipped = [], []
         for rec in records:
+            if common_ctx.get("tienda") and not (rec.get("tienda") or rec.get("plataforma")):
+                rec["tienda"] = common_ctx["tienda"]
+            if common_ctx.get("detalle") and not rec.get("detalle"):
+                rec["detalle"] = common_ctx["detalle"]
             rec = normalize_record(rec)
             if not rec["valor"]:
                 skipped.append((rec, "Falta el valor"))
@@ -936,8 +965,13 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("No entendí gastos en el audio. Decime el/los monto(s) y una descripción corta (ej: 'comida almuerzo 28000 y café 5000').\nTranscripción: " + transcript[:500])
             return
 
+        common_ctx = infer_common_context(transcript)
         saved, skipped = [], []
         for rec in records:
+            if common_ctx.get("tienda") and not (rec.get("tienda") or rec.get("plataforma")):
+                rec["tienda"] = common_ctx["tienda"]
+            if common_ctx.get("detalle") and not rec.get("detalle"):
+                rec["detalle"] = common_ctx["detalle"]
             rec = normalize_record(rec)
             if not rec["valor"]:
                 skipped.append((rec, "Falta el valor"))

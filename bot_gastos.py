@@ -1,4 +1,5 @@
-import os, json, re, tempfile, datetime as dt, traceback
+import os, json, re, tempfile, datetime as dt, traceback, ast
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 import pytz
 from dotenv import load_dotenv
@@ -383,6 +384,222 @@ def parse_json_strict(text):
         pass
     return None
 
+# === Operaciones matem�ticas desde texto/audio ===
+MATH_SYMBOL_PATTERN = re.compile(r"\d[\d\.,\s]*[+\-*/x×÷]\s*\d", re.IGNORECASE)
+MATH_KEYWORD_MAP = {
+    "div": ("divide", "dividir", "división", "division", "partido", "fracción", "fraccion"),
+    "mul": ("multiplica", "multiplicar", "producto"),
+    "sub": ("resta", "restar"),
+    "add": ("suma", "sumar", "adiciona", "agrega", "totaliza"),
+}
+MATH_GENERIC_TRIGGERS = ("calcula", "calcular", "resultado", "cuanto es", "cuánto es", "operacion", "operación")
+
+def _normalize_number_token(token: str) -> str:
+    """Normaliza un string num�rico estilo COP (28.500, 12,5, etc.) a formato decimal."""
+    if not token:
+        return ""
+    raw = token.strip().lower()
+    raw = raw.replace("cop", "").replace("$", "")
+    raw = raw.replace(" ", "")
+    # Soporte para n�meros tipo 12k
+    if raw.endswith("k"):
+        raw = raw[:-1]
+        if raw:
+            base = _normalize_number_token(raw)
+            if not base:
+                return ""
+            try:
+                return str(Decimal(base) * Decimal("1000"))
+            except InvalidOperation:
+                return ""
+    raw = re.sub(r"[^0-9,\.-]", "", raw)
+    if not raw:
+        return ""
+    if "," in raw and "." in raw:
+        raw = raw.replace(".", "")
+        raw = raw.replace(",", ".")
+    elif "," in raw:
+        parts = raw.split(",")
+        if len(parts[-1]) in (1, 2):
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "." in raw:
+        parts = raw.split(".")
+        if len(parts[-1]) == 3 and len(parts) == 2:
+            raw = raw.replace(".", "")
+    return raw
+
+def _normalize_numbers_in_expr(expr: str) -> str:
+    def repl(match):
+        normalized = _normalize_number_token(match.group(0))
+        return normalized or "0"
+    return re.sub(r"\d[\d\.,]*", repl, expr)
+
+def _extract_numbers(text: str):
+    matches = re.findall(r"-?\d[\d\.,]*", text)
+    numbers = []
+    for raw in matches:
+        norm = _normalize_number_token(raw)
+        if not norm:
+            continue
+        try:
+            numbers.append(Decimal(norm))
+        except InvalidOperation:
+            continue
+    return numbers
+
+def _format_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return f"{int(normalized)}"
+    text = format(normalized, "f")
+    return text.rstrip("0").rstrip(".")
+
+def _pretty_expression(expr: str) -> str:
+    display = expr.replace("*", "×").replace("/", "÷")
+    display = re.sub(r"([+\-×÷()])", r" \1 ", display)
+    display = re.sub(r"\s+", " ", display)
+    display = display.replace("( ", "(").replace(" )", ")")
+    return display.strip()
+
+def _safe_eval_math_expr(expr: str) -> Decimal:
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("No pude interpretar la operaci�n.") from exc
+
+    allowed = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Num, ast.Load, ast.Constant, ast.USub, ast.UAdd)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            raise ValueError("Solo soporto +, -, × y ÷.")
+        elif isinstance(node, ast.UnaryOp) and not isinstance(node.op, (ast.UAdd, ast.USub)):
+            raise ValueError("Operador no soportado.")
+        elif not isinstance(node, allowed):
+            raise ValueError("Expresi�n no soportada.")
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                if right == 0:
+                    raise ValueError("No puedo dividir por cero.")
+                return left / right
+        if isinstance(node, ast.UnaryOp):
+            val = _eval(node.operand)
+            return val if isinstance(node.op, ast.UAdd) else -val
+        if isinstance(node, ast.Num):
+            return Decimal(str(node.n))
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return Decimal(str(node.value))
+            raise ValueError("Valor num�rico no soportado.")
+        raise ValueError("Expresi�n no soportada.")
+
+    return _eval(tree.body)
+
+def _build_symbolic_expression(text: str) -> str:
+    if not MATH_SYMBOL_PATTERN.search(text):
+        return ""
+    expr = text.lower()
+    expr = expr.replace("÷", "/").replace("×", "*")
+    expr = re.sub(r"(\d[\d\.,]*)\s+(por|x)\s+(\d[\d\.,]*)", r"\1*\3", expr)
+    expr = re.sub(r"(\d[\d\.,]*)\s+entre\s+(\d[\d\.,]*)", r"\1/\2", expr)
+    expr = re.sub(r"[a-z�]+", " ", expr)
+    expr = re.sub(r"[^0-9+\-*/().,]", " ", expr)
+    expr = re.sub(r"\s+", "", expr)
+    expr = _normalize_numbers_in_expr(expr)
+    if not re.search(r"\d", expr):
+        return ""
+    if not re.search(r"[+\-*/]", expr):
+        return ""
+    return expr
+
+def _detect_keyword_operation(text: str):
+    lower = text.lower()
+    for op, keywords in MATH_KEYWORD_MAP.items():
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", lower):
+                return op
+    return None
+
+def evaluate_math_request(text: str):
+    """Devuelve dict con 'expression' y 'result' si el texto contiene una operaci�n."""
+    if not text or not re.search(r"\d", text):
+        return None
+
+    lowered = text.lower()
+    has_generic = any(trigger in lowered for trigger in MATH_GENERIC_TRIGGERS)
+
+    expr = _build_symbolic_expression(text)
+    if expr:
+        value = _safe_eval_math_expr(expr)
+        return {
+            "expression": _pretty_expression(expr),
+            "result": value,
+            "result_display": _format_decimal(value),
+        }
+
+    keyword_op = _detect_keyword_operation(text)
+    if not keyword_op and not has_generic:
+        return None
+
+    numbers = _extract_numbers(text)
+    if len(numbers) < 2:
+        raise ValueError("Necesito al menos dos n�meros para operar.")
+
+    if keyword_op == "div":
+        result = numbers[0]
+        for n in numbers[1:]:
+            if n == 0:
+                raise ValueError("No puedo dividir por cero.")
+            result = result / n
+        symbol = "÷"
+    elif keyword_op == "mul":
+        result = numbers[0]
+        for n in numbers[1:]:
+            result = result * n
+        symbol = "×"
+    elif keyword_op == "sub":
+        result = numbers[0]
+        for n in numbers[1:]:
+            result = result - n
+        symbol = "-"
+    else:
+        result = sum(numbers)
+        symbol = "+"
+
+    expr_display = f" {symbol} ".join(_format_decimal(n) for n in numbers)
+    return {
+        "expression": expr_display,
+        "result": result,
+        "result_display": _format_decimal(result),
+    }
+
+
+async def maybe_reply_with_math(update: Update, text: str) -> bool:
+    """Detecta si el mensaje pide una operaci�n; si es as�, responde y retorna True."""
+    if not text:
+        return False
+    try:
+        payload = evaluate_math_request(text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return True
+    if payload:
+        await update.message.reply_text(f"Resultado: {payload['expression']} = {payload['result_display']}")
+        return True
+    return False
+
 # === Llamada a GPT: NO inferir fecha/hora; dejarlas vacías si no están en el texto ===
 def call_gpt_extract(msg_text):
     categories_hint = "; ".join(CATEGORIES_REFERENCE)
@@ -728,6 +945,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if await maybe_reply_with_math(update, text):
+        return
     try:
         rec = call_gpt_extract(text)
         if not rec:
@@ -761,6 +980,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if await maybe_reply_with_math(update, text):
+        return
     try:
         parsed = call_gpt_extract_many(text)
         records = _coerce_to_records(parsed)
@@ -919,6 +1140,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No pude transcribir el audio ??. ¿Podés intentar de nuevo o mandar texto?")
             return
 
+        if await maybe_reply_with_math(update, transcript):
+            return
+
         rec = call_gpt_extract(transcript)
         if not rec:
             await update.message.reply_text("?? No entendí el gasto del audio. Decime el monto y una descripción corta (ej: 'comida almuerzo 28000').")
@@ -957,6 +1181,9 @@ async def handle_audio_multi(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if not transcript:
             await update.message.reply_text("No pude transcribir el audio. ¿Podés intentar de nuevo o mandar texto?")
+            return
+
+        if await maybe_reply_with_math(update, transcript):
             return
 
         parsed = call_gpt_extract_many(transcript)
